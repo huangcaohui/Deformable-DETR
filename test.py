@@ -2,55 +2,86 @@ import torch
 import datasets.transforms as T
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
+import numpy as np
+import cv2
 from util.box_ops import box_cxcywh_to_xyxy
 
-# 创建目标检测模型，这里使用 Faster R-CNN 作为示例
-model = torch.load("./exps/r50_deformable_detr/checkpoint0094.pth")['model']  # 加载训练好的模型权重
-model.to('cuda')  # 将模型移动到 CUDA 上以加速推理
+model_path = "./exps/r50_deformable_detr/checkpoint0094.pth"  # 模型权重路径
+image_path = './data/odo_annotated_coco/test/odo (1).jpg'  # 测试图像路径
+save_path = '/home/caohuihu/share/result.png'  # 保存结果图像路径
+conf_threshold = 0.5  # 置信度阈值
 
-# 加载模型权重
-model.eval()  # 将模型设置为评估模式
 
-# 读取测试图像
+def load_model(model_path):
+    # 加载目标检测模型
+    model = torch.load(model_path)['model']  # 加载训练好的模型权重
+    model.to('cuda')  # 将模型移动到 CUDA 上以加速推理
+    model.eval()  # 将模型设置为评估模式
+    return model
 
-test_image_path = './data/odo_annotated_coco/test/odo (1).jpg'  # 替换为您的测试图像路径
-test_image = Image.open(test_image_path).convert("RGB")
+def preprocess_image(image_path):
+    # 读取测试图像
+    test_image = Image.open(image_path).convert("RGB")
 
-# 进行图像转换
-test_image, _ = T.RandomResize([800], max_size=1333)(test_image)
-img, _ = T.ToTensor()(test_image)
-img, _ = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img)
-img = img.unsqueeze(0).to('cuda')  # 添加批次维度
-h, w = img.shape[-2:]
+    # 进行图像转换
+    img, _ = T.RandomResize([800], max_size=1333)(test_image)
+    img, _ = T.ToTensor()(img)
+    img, _ = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img)
+    img = img.unsqueeze(0).to('cuda')  # 添加批次维度
 
-# 使用模型进行目标检测
-with torch.no_grad():
-    predictions = model(img)
+    # 原图像和resize后图像的宽高
+    w1, h1 = test_image.size
+    h2, w2 = img.shape[-2:]
+    ratio_height, ratio_width = h1 / h2, w1 / w2
 
-# 提取预测的目标框、类别
-boxes = torch.squeeze(predictions['pred_boxes'])
-labels = torch.squeeze(predictions['pred_logits'])
+    return test_image, img, (w1, h1), (w2, h2), (ratio_width, ratio_height)
 
-# 设置阈值以过滤低置信度的目标
-threshold = 0.2
-filtered_indices = labels > threshold
-labels = labels[filtered_indices]
-boxes = boxes[filtered_indices]
+def detect_objects(model, image_tensor, threshold=0.2):
+    # 使用模型进行目标检测
+    with torch.no_grad():
+        predictions = model(image_tensor)
 
-# 创建可绘制对象
-draw = ImageDraw.Draw(test_image)
-font = ImageFont.truetype('/usr/share/fonts/smc/Meera.ttf', size=40)
+    # 提取预测的目标框、类别
+    boxes = torch.squeeze(predictions['pred_boxes'])
+    labels = torch.squeeze(predictions['pred_logits']).sigmoid()    # logits是MLP输出，需要sigmoid函数转换为概率
 
-# 在图像上绘制目标框和标签
-for box, label in zip(boxes, labels):
-    box = box.cpu() * torch.tensor([w, h, w, h], dtype=torch.float32)
-    box = box_cxcywh_to_xyxy(box).numpy()
-    score = label.cpu().numpy()
-    color = (0, 255, 0)  # 设置目标框颜色为红色 (R, G, B)
-    draw.rectangle(box, outline=color, width=3)
-    draw.text((box[0], box[1] - 35), f'Score: {score:.2f}', fill=color, font=font)
+    # 设置阈值以过滤低置信度的目标
+    filtered_indices = labels > threshold
+    labels = labels[filtered_indices]
+    boxes = boxes[filtered_indices]
 
-# 可视化结果
-plt.imshow(test_image)
-plt.axis('off')
-plt.show()
+    return boxes, labels
+
+def draw_and_save_results(image, boxes, labels, wh2, ratio_wh, save_path):
+    # 创建可绘制对象
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype('/usr/share/fonts/smc/Meera.ttf', size=80)
+
+    # 在图像上绘制目标框和标签
+    for box, label in zip(boxes, labels):
+        box = box.cpu() * torch.tensor([wh2[0], wh2[1], wh2[0], wh2[1]], dtype=torch.float32)
+        box = box_cxcywh_to_xyxy(box) * torch.tensor([ratio_wh[0], ratio_wh[1], ratio_wh[0], ratio_wh[1]], dtype=torch.float32)
+        box = box.numpy()
+        score = label.cpu().numpy()
+        color = (0, 255, 0)  # 设置目标框颜色为绿色 (R, G, B)
+        draw.rectangle(box, outline=color, width=8)
+        draw.text((box[0], box[1] - 90), f'Score: {score:.2f}', fill=color, font=font)
+
+    # 保存图像
+    image_np = np.array(image)
+    image_cv2 = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(save_path, image_cv2)
+
+def main():
+    model = load_model(model_path)
+    test_image, image_tensor, wh1, wh2, ratio_wh = preprocess_image(image_path)
+    boxes, labels = detect_objects(model, image_tensor, threshold=conf_threshold)
+    draw_and_save_results(test_image, boxes, labels, wh2, ratio_wh, save_path)
+
+    # 可视化图像
+    plt.imshow(test_image)
+    plt.axis('off')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
